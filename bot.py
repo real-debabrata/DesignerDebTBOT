@@ -17,6 +17,7 @@ Beginner notes:
 """
 
 import os
+import html
 import logging
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -44,11 +45,38 @@ CHANNEL_INVITE_LINK = os.getenv("CHANNEL_INVITE_LINK")  # https://t.me/yourchann
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 REQUIRED_REFERRALS = int(os.getenv("REQUIRED_REFERRALS", "2"))
 
-SERVICE_TYPE = os.getenv("SERVICE_TYPE", "text")     # "text" or "file"
+SERVICE_TYPE = os.getenv("SERVICE_TYPE", "text")     # "text" or "file"  (legacy single-item fallback)
 SERVICE_TEXT = os.getenv("SERVICE_TEXT", "Here is your service/link!")
 SERVICE_FILE_PATH = os.getenv("SERVICE_FILE_PATH", "")
 
 DB_PATH = "bot_data.db"
+
+
+def parse_services():
+    """
+    Reads SERVICES from .env and turns it into a list of buttons.
+    Format: Label|type|value ; Label|type|value ; ...
+    type is one of: url, file, code, text
+
+    Example:
+      SERVICES=🔗 Premium Link|url|https://t.me/+abc123;📄 Bonus PDF|file|bonus.pdf;🎟 Promo Code|code|SAVE20NOW
+    """
+    raw = os.getenv("SERVICES", "")
+    items = []
+    for i, chunk in enumerate(raw.split(";")):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = [p.strip() for p in chunk.split("|")]
+        if len(parts) != 3:
+            logger.warning("Skipping malformed SERVICES entry: %r", chunk)
+            continue
+        label, s_type, value = parts
+        items.append({"id": f"svc{i}", "label": label, "type": s_type, "value": value})
+    return items
+
+
+SERVICES = parse_services()
 
 if not BOT_TOKEN or not CHANNEL_ID or not CHANNEL_INVITE_LINK:
     raise SystemExit(
@@ -171,6 +199,20 @@ def recheck_keyboard():
     )
 
 
+def service_keyboard():
+    """One tappable button per item in SERVICES. 'url' buttons open instantly;
+    'file'/'code'/'text' buttons trigger the bot to send that item on tap."""
+    rows = []
+    for svc in SERVICES:
+        if svc["type"] == "url":
+            rows.append([InlineKeyboardButton(svc["label"], url=svc["value"])])
+        else:
+            rows.append(
+                [InlineKeyboardButton(svc["label"], callback_data=f"get_{svc['id']}")]
+            )
+    return InlineKeyboardMarkup(rows)
+
+
 # --------------------------------------------------------------------------
 # Handlers
 # --------------------------------------------------------------------------
@@ -267,9 +309,16 @@ async def verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def deliver_service(context: ContextTypes.DEFAULT_TYPE, user_id: int):
-    """Sends the actual product: a text/link message, or a file."""
+    """Sends the actual product. Uses tappable buttons if SERVICES is set
+    in .env, otherwise falls back to the old single text/file behavior."""
     try:
-        if SERVICE_TYPE == "file" and SERVICE_FILE_PATH:
+        if SERVICES:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="🎉 You're all set! Tap below to access your service:",
+                reply_markup=service_keyboard(),
+            )
+        elif SERVICE_TYPE == "file" and SERVICE_FILE_PATH:
             with open(SERVICE_FILE_PATH, "rb") as f:
                 await context.bot.send_document(chat_id=user_id, document=f, caption=SERVICE_TEXT)
         else:
@@ -278,6 +327,55 @@ async def deliver_service(context: ContextTypes.DEFAULT_TYPE, user_id: int):
             )
     except TelegramError as e:
         logger.error("Failed to deliver service to %s: %s", user_id, e)
+
+
+async def get_service_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles taps on a 'file' / 'code' / 'text' service button."""
+    query = update.callback_query
+    user = query.from_user
+
+    # Defense in depth: re-check eligibility even though only this user
+    # can tap buttons inside their own private chat with the bot.
+    row = get_user(user.id)
+    if row is None or not row[4] or row[3] < REQUIRED_REFERRALS:
+        await query.answer("⚠️ You need to verify and complete your referrals first.", show_alert=True)
+        return
+
+    svc_id = query.data.removeprefix("get_")
+    svc = next((s for s in SERVICES if s["id"] == svc_id), None)
+    if svc is None:
+        await query.answer("⚠️ That item isn't available anymore.", show_alert=True)
+        return
+
+    await query.answer()  # dismiss the loading spinner on the button
+
+    try:
+        if svc["type"] == "file":
+            with open(svc["value"], "rb") as f:
+                await context.bot.send_document(chat_id=user.id, document=f, caption=svc["label"])
+        elif svc["type"] == "code":
+            # Wrapped in <code> so Telegram shows a tap-to-copy monospace block.
+            safe_value = html.escape(svc["value"])
+            await context.bot.send_message(
+                chat_id=user.id, text=f"<code>{safe_value}</code>", parse_mode=ParseMode.HTML
+            )
+        else:  # "text"
+            await context.bot.send_message(chat_id=user.id, text=svc["value"])
+    except (TelegramError, FileNotFoundError) as e:
+        logger.error("Failed to deliver service item %s to %s: %s", svc_id, user.id, e)
+        await context.bot.send_message(
+            chat_id=user.id, text="⚠️ Something went wrong delivering that. Please try again shortly."
+        )
+
+
+async def my_service(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lets an already-unlocked user re-summon their service buttons any time."""
+    user = update.effective_user
+    row = get_user(user.id)
+    if row is None or not row[4] or row[3] < REQUIRED_REFERRALS:
+        await update.message.reply_text("You haven't unlocked the service yet. Send /start to begin.")
+        return
+    await deliver_service(context, user.id)
 
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -310,7 +408,9 @@ def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("myservice", my_service))
     app.add_handler(CallbackQueryHandler(verify, pattern="^verify$"))
+    app.add_handler(CallbackQueryHandler(get_service_item, pattern="^get_svc"))
 
     logger.info("Bot started. Polling for updates...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
