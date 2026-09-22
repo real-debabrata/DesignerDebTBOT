@@ -173,6 +173,19 @@ def increment_referral(referrer_id: int):
     conn.close()
 
 
+def add_referral_count(user_id: int, amount: int):
+    """Adds (or subtracts, if amount is negative) to a user's referral count.
+    Never lets it go below 0."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "UPDATE users SET referral_count = MAX(referral_count + ?, 0) WHERE user_id=?",
+        (amount, user_id),
+    )
+    conn.commit()
+    conn.close()
+
+
 def set_got_service(user_id: int):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -308,9 +321,10 @@ async def verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text, reply_markup=recheck_keyboard())
 
 
-async def deliver_service(context: ContextTypes.DEFAULT_TYPE, user_id: int):
+async def deliver_service(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
     """Sends the actual product. Uses tappable buttons if SERVICES is set
-    in .env, otherwise falls back to the old single text/file behavior."""
+    in .env, otherwise falls back to the old single text/file behavior.
+    Returns True if it was sent successfully, False otherwise."""
     try:
         if SERVICES:
             await context.bot.send_message(
@@ -325,8 +339,10 @@ async def deliver_service(context: ContextTypes.DEFAULT_TYPE, user_id: int):
             await context.bot.send_message(
                 chat_id=user_id, text=SERVICE_TEXT, parse_mode=ParseMode.HTML
             )
+        return True
     except TelegramError as e:
         logger.error("Failed to deliver service to %s: %s", user_id, e)
+        return False
 
 
 async def get_service_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -378,6 +394,53 @@ async def my_service(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await deliver_service(context, user.id)
 
 
+async def add_referral(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: manually adjust a user's referral count.
+    Usage: /addref <user_id> [amount]   (amount defaults to 1, can be negative to subtract)
+    """
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    if not context.args or not context.args[0].lstrip("-").isdigit():
+        await update.message.reply_text(
+            "Usage: /addref <user_id> [amount]\n"
+            "Example: /addref 123456789 2  (adds 2 referrals)\n"
+            "Example: /addref 123456789 -1  (removes 1 referral)"
+        )
+        return
+
+    target_id = int(context.args[0])
+    amount = 1
+    if len(context.args) > 1:
+        if not context.args[1].lstrip("-").isdigit():
+            await update.message.reply_text("Amount must be a whole number, e.g. 2 or -1.")
+            return
+        amount = int(context.args[1])
+
+    # Create a placeholder record if this person hasn't started the bot yet.
+    if get_user(target_id) is None:
+        add_user(target_id, "unknown")
+
+    add_referral_count(target_id, amount)
+    _, _, _, referral_count, verified_join, got_service = get_user(target_id)
+
+    await update.message.reply_text(
+        f"✅ User {target_id} now has {referral_count} referral(s)."
+    )
+
+    # If this pushes them over the line and they're already verified, deliver right away.
+    if verified_join and referral_count >= REQUIRED_REFERRALS and not got_service:
+        set_got_service(target_id)
+        delivered = await deliver_service(context, target_id)
+        if delivered:
+            await update.message.reply_text(f"🎉 Service auto-delivered to {target_id}.")
+        else:
+            await update.message.reply_text(
+                f"⚠️ Couldn't message {target_id} directly — they probably haven't started "
+                f"a chat with the bot yet. They can grab it themselves with /myservice once they do."
+            )
+
+
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin-only: quick usage stats. Usage: /stats"""
     if update.effective_user.id != ADMIN_ID:
@@ -409,6 +472,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("myservice", my_service))
+    app.add_handler(CommandHandler("addref", add_referral))
     app.add_handler(CallbackQueryHandler(verify, pattern="^verify$"))
     app.add_handler(CallbackQueryHandler(get_service_item, pattern="^get_svc"))
 
