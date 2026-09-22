@@ -47,7 +47,14 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import sqlite3
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BotCommand,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
+)
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -912,6 +919,30 @@ async def add_referral(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # --------------------------------------------------------------------------
+# Command menu (the "/" button next to the message box in Telegram)
+# --------------------------------------------------------------------------
+async def register_commands(application):
+    """Populates Telegram's native command menu so people can tap a command
+    instead of typing it. Admin sees extra entries; everyone else sees the
+    plain user commands. Runs once automatically when the bot starts."""
+    user_commands = [
+        BotCommand("start", "Show the greeting & task"),
+        BotCommand("myservice", "Get your reward buttons again"),
+    ]
+    await application.bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
+
+    if ADMIN_ID:
+        admin_commands = user_commands + [
+            BotCommand("admin", "Open the admin control panel"),
+            BotCommand("stats", "Quick usage stats"),
+            BotCommand("addref", "Manually adjust a referral count"),
+        ]
+        await application.bot.set_my_commands(
+            admin_commands, scope=BotCommandScopeChat(chat_id=ADMIN_ID)
+        )
+
+
+# --------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------
 def main():
@@ -920,7 +951,7 @@ def main():
     # Keep-alive server for hosts that require a bound port (e.g. Render free tier).
     threading.Thread(target=start_keep_alive_server, daemon=True).start()
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(register_commands).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("myservice", my_service))
