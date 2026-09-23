@@ -55,6 +55,7 @@ Beginner notes:
 """
 
 import asyncio
+import calendar
 import csv
 import html
 import io
@@ -64,7 +65,7 @@ import os
 import re
 import secrets
 import threading
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import sqlite3
@@ -122,6 +123,81 @@ DEFAULT_TASK = (
 )
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+# --------------------------------------------------------------------------
+# Subscription validity helpers
+# --------------------------------------------------------------------------
+# A reward can optionally carry a "duration" (e.g. "1 year", "6 months",
+# "30 days"), stored internally in a compact form like "1y", "6m", "30d".
+# When the admin marks a redemption fulfilled, that duration is applied
+# starting from today to work out the last valid day automatically — e.g.
+# redeemed/fulfilled on 27 Sep 2026 with a 1-year duration is valid through
+# 26 Sep 2027 (the day before the same date next year, since the start day
+# itself counts as day 1).
+DURATION_RE = re.compile(
+    r"^(\d+)\s*(day|days|d|month|months|mon|mo|m|year|years|yr|yrs|y)$", re.IGNORECASE
+)
+NO_EXPIRY_WORDS = {
+    "none", "no", "n/a", "na", "-", "lifetime", "forever",
+    "no expiry", "no expiration", "permanent", "onetime", "one-time", "one time",
+}
+
+
+def normalize_duration(text: str):
+    """Parses free-form admin input into a compact duration string like
+    '1y' / '6m' / '30d', or '' for a no-expiry/lifetime item. Returns None
+    if the text couldn't be understood at all (caller should re-prompt)."""
+    t = text.strip().lower()
+    if t == "" or t in NO_EXPIRY_WORDS:
+        return ""
+    match = DURATION_RE.match(t)
+    if not match:
+        return None
+    amount, unit = match.group(1), match.group(2).lower()
+    if unit in ("day", "days", "d"):
+        return f"{amount}d"
+    if unit in ("month", "months", "mon", "mo", "m"):
+        return f"{amount}m"
+    return f"{amount}y"
+
+
+def duration_display(duration: str) -> str:
+    """Human-friendly label for a normalized duration string, e.g. '1y' -> '1 year'."""
+    if not duration:
+        return "no expiry"
+    amount = int(duration[:-1])
+    unit_word = {"d": "day", "m": "month", "y": "year"}[duration[-1]]
+    if amount != 1:
+        unit_word += "s"
+    return f"{amount} {unit_word}"
+
+
+def add_months(d: date, months: int) -> date:
+    """Adds calendar months to a date, clamping the day to the last valid
+    day of the target month (so e.g. 31 Jan + 1 month -> 28/29 Feb)."""
+    month_index = d.month - 1 + months
+    year = d.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(d.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day)
+
+
+def compute_valid_until(start: date, duration: str):
+    """Returns the last valid day for a subscription of `duration` starting
+    on `start`, or None if the reward has no expiry. The start day itself
+    counts as day 1, so a 1-year duration starting 27 Sep 2026 ends
+    26 Sep 2027, matching how subscription validity is normally quoted."""
+    if not duration:
+        return None
+    amount = int(duration[:-1])
+    unit = duration[-1]
+    if unit == "d":
+        end = start + timedelta(days=amount)
+    elif unit == "m":
+        end = add_months(start, amount)
+    else:  # 'y'
+        end = add_months(start, amount * 12)
+    return end - timedelta(days=1)
 
 if not BOT_TOKEN or not CHANNEL_ID_ENV or not CHANNEL_INVITE_LINK_ENV:
     raise SystemExit(
@@ -201,8 +277,24 @@ def init_db():
         )
         """
     )
+    # Additive migration only — never drops/rewrites existing rows, so any
+    # redemptions already logged on a live deployment stay exactly as they
+    # are. Safe to run every startup: it's a no-op once the columns exist.
+    _ensure_column(conn, "redemptions", "duration", "TEXT DEFAULT ''")
+    _ensure_column(conn, "redemptions", "fulfilled_at", "TEXT DEFAULT ''")
+    _ensure_column(conn, "redemptions", "valid_until", "TEXT DEFAULT ''")
     conn.commit()
     conn.close()
+
+
+def _ensure_column(conn, table: str, column: str, coltype: str):
+    """Adds `column` to `table` if it isn't already there. Used to evolve the
+    schema on an already-deployed DB file without touching existing data."""
+    c = conn.cursor()
+    c.execute(f"PRAGMA table_info({table})")
+    existing = {row[1] for row in c.fetchall()}
+    if column not in existing:
+        c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
 
 
 def get_user(user_id: int):
@@ -289,20 +381,52 @@ def build_stats_text() -> str:
 # --------------------------------------------------------------------------
 # Redemption log helpers (the "needs email / you fulfill by hand" queue)
 # --------------------------------------------------------------------------
-def create_redemption(user_id, username, reward_id, reward_label, cost, email, status) -> int:
+def create_redemption(user_id, username, reward_id, reward_label, cost, email, status, duration: str = "") -> int:
+    """`duration` (e.g. '1y', '6m', '30d', or '' for no expiry) is captured
+    from the reward at the moment of the request, so editing or removing the
+    reward later never changes what an already-pending redemption is owed."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
         """
-        INSERT INTO redemptions (user_id, username, reward_id, reward_label, cost, email, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO redemptions (user_id, username, reward_id, reward_label, cost, email, status, created_at, duration)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (user_id, username, reward_id, reward_label, cost, email, status, datetime.now(timezone.utc).isoformat()),
+        (user_id, username, reward_id, reward_label, cost, email, status,
+         datetime.now(timezone.utc).isoformat(), duration),
     )
     conn.commit()
     new_id = c.lastrowid
     conn.close()
     return new_id
+
+
+def get_redemption(redemption_id: int):
+    """Returns one redemption row as (id, user_id, username, reward_id,
+    reward_label, cost, email, status, created_at, duration, fulfilled_at,
+    valid_until), or None."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "SELECT id, user_id, username, reward_id, reward_label, cost, email, "
+        "status, created_at, duration, fulfilled_at, valid_until "
+        "FROM redemptions WHERE id=?",
+        (redemption_id,),
+    )
+    row = c.fetchone()
+    conn.close()
+    return row
+
+
+def mark_redemption_fulfilled(redemption_id: int, fulfilled_at: str, valid_until: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "UPDATE redemptions SET status='fulfilled', fulfilled_at=?, valid_until=? WHERE id=?",
+        (fulfilled_at, valid_until, redemption_id),
+    )
+    conn.commit()
+    conn.close()
 
 
 def get_recent_redemptions(limit: int = 10, status: str | None = None):
@@ -418,6 +542,11 @@ def parse_rewards_string(raw: str):
                         — use this for anything like Canva Pro that needs a
                         human to actually deliver it
       cost = how many referrals this item costs. 0 = free/instant.
+      duration = optional, only meaningful for "redeem" items. e.g. "1 year",
+                        "6 months", "30 days", or blank/"none" for no expiry.
+                        Once you mark a redemption fulfilled, this is applied
+                        starting that day to work out — and tell the user —
+                        the last valid day automatically.
     """
     items = []
     for chunk in raw.split(";"):
@@ -425,17 +554,22 @@ def parse_rewards_string(raw: str):
         if not chunk:
             continue
         parts = [p.strip() for p in chunk.split("|")]
-        if len(parts) not in (3, 4):
+        if len(parts) not in (3, 4, 5):
             logger.warning("Skipping malformed reward entry: %r", chunk)
             continue
         label, r_type, value = parts[0], parts[1], parts[2]
-        cost_str = parts[3] if len(parts) == 4 else "0"
+        cost_str = parts[3] if len(parts) >= 4 else "0"
+        duration_str = parts[4] if len(parts) == 5 else ""
         if r_type not in ("url", "file", "code", "text", "redeem"):
             logger.warning("Skipping reward entry with unknown type: %r", chunk)
             continue
         if not cost_str.isdigit():
             logger.warning("Skipping reward entry with a bad cost: %r", chunk)
             continue
+        duration = normalize_duration(duration_str)
+        if duration is None:
+            logger.warning("Skipping reward entry with a bad duration: %r", chunk)
+            duration = ""
         items.append(
             {
                 "id": secrets.token_hex(3),
@@ -443,13 +577,17 @@ def parse_rewards_string(raw: str):
                 "type": r_type,
                 "value": value,
                 "cost": int(cost_str),
+                "duration": duration,
             }
         )
     return items
 
 
 def rewards_to_raw_string(rewards) -> str:
-    return ";".join(f"{r['label']}|{r['type']}|{r['value']}|{r.get('cost', 0)}" for r in rewards)
+    return ";".join(
+        f"{r['label']}|{r['type']}|{r['value']}|{r.get('cost', 0)}|{r.get('duration', '')}"
+        for r in rewards
+    )
 
 
 def get_rewards():
@@ -459,6 +597,7 @@ def get_rewards():
             rewards = json.loads(raw)
             for r in rewards:
                 r.setdefault("cost", 0)  # migrate any old entries saved with no cost field
+                r.setdefault("duration", "")  # migrate any old entries saved with no duration field
             return rewards
         except json.JSONDecodeError:
             logger.error("Corrupt services_json in settings — reseeding from .env SERVICES.")
@@ -570,7 +709,8 @@ def rewards_listing_text(rewards) -> str:
     for r in rewards:
         cost = r.get("cost", 0)
         cost_label = f"{cost} referrals" if cost else "free"
-        lines.append(f"• {r['label']} — {r['type']}, {cost_label}")
+        extra = f", valid {duration_display(r['duration'])}" if r.get("duration") else ""
+        lines.append(f"• {r['label']} — {r['type']}, {cost_label}{extra}")
     return "\n".join(lines) or "(none yet)"
 
 
@@ -581,8 +721,10 @@ def redemptions_panel_content(limit: int = 10):
     lines = ["📜 Pending Redemptions (most recent first):\n"]
     keyboard_rows = []
     for r in rows:
-        rid, user_id, username, reward_id, reward_label, cost, email, status, created_at = r
-        lines.append(f"#{rid} • @{username or user_id} • {reward_label} • {email}")
+        (rid, user_id, username, reward_id, reward_label, cost, email,
+         status, created_at, duration, fulfilled_at, valid_until) = r
+        validity_note = f" • valid {duration_display(duration)} once sent" if duration else ""
+        lines.append(f"#{rid} • @{username or user_id} • {reward_label} • {email}{validity_note}")
         keyboard_rows.append(
             [InlineKeyboardButton(f"✅ Mark #{rid} fulfilled", callback_data=f"adm:fulfill:{rid}")]
         )
@@ -854,7 +996,8 @@ async def export_redemptions_csv(context: ContextTypes.DEFAULT_TYPE, chat_id: in
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(
-        ["id", "user_id", "username", "reward_id", "reward_label", "cost", "email", "status", "created_at"]
+        ["id", "user_id", "username", "reward_id", "reward_label", "cost", "email", "status",
+         "created_at", "duration", "fulfilled_at", "valid_until"]
     )
     writer.writerows(rows)
     data = io.BytesIO(buf.getvalue().encode("utf-8"))
@@ -959,8 +1102,10 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         raw_current = rewards_to_raw_string(get_rewards())
         await query.edit_message_text(
             "Paste the FULL replacement list, in this format:\n"
-            "Label|type|value|cost;Label|type|value|cost\n"
-            "(type = url, file, code, text, or redeem — cost = referrals required, 0 = free)\n\n"
+            "Label|type|value|cost|duration;Label|type|value|cost|duration\n"
+            "(type = url, file, code, text, or redeem — cost = referrals required, 0 = "
+            "free — duration only matters for 'redeem' items: e.g. '1 year', "
+            "'6 months', '30 days', or blank/'none' for no expiry)\n\n"
             f"Current:\n{raw_current or '(none)'}\n\n"
             "(Send /cancel to abort.)",
             reply_markup=cancel_keyboard(),
@@ -972,7 +1117,39 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action == "fulfill":
         rid = int(parts[2])
-        set_redemption_status(rid, "fulfilled")
+        row = get_redemption(rid)
+        if row is not None:
+            (_, red_user_id, _username, _reward_id, reward_label, _cost, email,
+             _status, _created_at, duration, _fulfilled_at, _valid_until) = row
+
+            now = datetime.now(timezone.utc)
+            valid_until_date = compute_valid_until(now.date(), duration)
+            valid_until_str = valid_until_date.isoformat() if valid_until_date else ""
+            mark_redemption_fulfilled(rid, now.isoformat(), valid_until_str)
+
+            # Best-effort: also record the fulfillment + validity date to
+            # Google Sheets if configured, since that lives outside Render
+            # and survives the free plan's disk wipes. Never blocks or fails
+            # the fulfillment itself — the local DB row is already updated.
+            await asyncio.to_thread(
+                sheets.append_fulfillment,
+                red_user_id, email, reward_label, duration_display(duration), now, valid_until_date,
+            )
+
+            # Notify the user on Telegram — best-effort; if they've blocked
+            # the bot, this just fails quietly and the fulfillment still stands.
+            user_text = (
+                f"🎉 Good news! Your redemption for \"{reward_label}\" has been fulfilled.\n\n"
+                f"📧 Please check the inbox (and spam/junk folder) of {email} for an "
+                f"invitation, and accept it to activate it."
+            )
+            if valid_until_date:
+                user_text += f"\n\n✅ Valid until: {valid_until_date.strftime('%d %b %Y')}."
+            try:
+                await context.bot.send_message(chat_id=red_user_id, text=user_text)
+            except TelegramError:
+                logger.warning("Could not notify user %s about fulfilled redemption #%s", red_user_id, rid)
+
         text, markup = redemptions_panel_content()
         await query.edit_message_text(text, reply_markup=markup)
 
@@ -1043,14 +1220,41 @@ async def handle_admin_awaiting(update: Update, context: ContextTypes.DEFAULT_TY
         else:
             value = text
         svc_new["value"] = value
+        if svc_type == "redeem":
+            context.user_data["awaiting"] = "svc_duration"
+            await message.reply_text(
+                "Does this need a validity/expiry date tracked? Once you mark a "
+                "redemption of this fulfilled, this is applied starting that day "
+                "to work out — and tell the user — when it runs out.\n\n"
+                "Reply with something like: 1 year, 6 months, 30 days\n"
+                "Or send 'none' if this has no expiry (e.g. a one-time perk):",
+                reply_markup=cancel_keyboard(),
+            )
+        else:
+            svc_new["duration"] = ""
+            context.user_data["awaiting"] = "svc_cost"
+            await message.reply_text(
+                "How many referrals should this cost? Send a whole number (0 = free/instant delivery):",
+                reply_markup=cancel_keyboard(),
+            )
+        return
+
+    if awaiting == "svc_duration":
+        duration = normalize_duration(text)
+        if duration is None:
+            await message.reply_text(
+                "Didn't understand that. Try formats like '1 year', '6 months', "
+                "'30 days', or send 'none' for no expiry."
+            )
+            return
+        svc_new = context.user_data.get("svc_new", {})
+        svc_new["duration"] = duration
         context.user_data["awaiting"] = "svc_cost"
-        prompt = (
+        await message.reply_text(
             "How many referrals should this cost? Send a whole number (redeem "
-            "items normally cost more than 0):"
-            if svc_type == "redeem"
-            else "How many referrals should this cost? Send a whole number (0 = free/instant delivery):"
+            "items normally cost more than 0):",
+            reply_markup=cancel_keyboard(),
         )
-        await message.reply_text(prompt, reply_markup=cancel_keyboard())
         return
 
     if awaiting == "svc_cost":
@@ -1059,6 +1263,7 @@ async def handle_admin_awaiting(update: Update, context: ContextTypes.DEFAULT_TY
             return
         svc_new = context.user_data.get("svc_new", {})
         svc_new["cost"] = int(text)
+        svc_new.setdefault("duration", "")
         svc_new["id"] = secrets.token_hex(3)
         rewards = get_rewards()
         rewards.append(svc_new)
@@ -1116,7 +1321,10 @@ async def handle_redeem_email(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     add_referral_count(user.id, -cost)
-    redemption_id = create_redemption(user.id, username, reward["id"], reward["label"], cost, email, "pending")
+    duration = reward.get("duration", "")
+    redemption_id = create_redemption(
+        user.id, username, reward["id"], reward["label"], cost, email, "pending", duration
+    )
     context.user_data.clear()
 
     new_balance = balance - cost
@@ -1141,7 +1349,10 @@ async def handle_redeem_email(update: Update, context: ContextTypes.DEFAULT_TYPE
                     f"Product: {reward['label']}\n"
                     f"Cost: {cost} referral(s)\n"
                     f"Email: {email}\n"
-                    f"Their new balance: {new_balance}"
+                    f"Validity once fulfilled: {duration_display(duration)}\n"
+                    f"Their new balance: {new_balance}\n\n"
+                    f"Mark it fulfilled from /admin -> Redemptions once you've sent it — "
+                    f"the user gets notified automatically."
                 ),
             )
         except TelegramError:
