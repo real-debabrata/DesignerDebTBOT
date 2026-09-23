@@ -1,2 +1,8 @@
 python-telegram-bot==21.7
 python-dotenv==1.0.1
+
+# --- Optional: only used if you set up Google Sheets logging for redemptions.
+# Safe to leave installed even if you never configure GOOGLE_SHEET_ID — the
+# bot just skips Sheets logging and falls back to local DB + CSV export.
+gspread>=6.1.0,<7
+google-auth>=2.30.0,<3

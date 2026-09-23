@@ -1,27 +1,42 @@
 """
-Telegram "Join + Refer to Unlock" bot — DesignerDebBot
+Telegram "Join + Refer to Redeem" bot — DesignerDebBot
 --------------------------------------------------------
 Flow:
 1. User starts the bot (optionally via a referral link).
-2. Bot shows a greeting + task message with THREE buttons:
-   📢 Channel | 🔗 Referral Link | ✅ Verify
-3. On Verify, bot checks channel membership via the Telegram API.
-4. Once joined, bot checks the user has referred enough friends
-   (friends must also join + verify to count).
-5. Once both conditions are met, the bot delivers the service
-   (tappable reward buttons) directly in the chat.
+2. Bot shows a greeting + task message with buttons:
+   📢 Channel | 🔗 Referral Link | ✅ Verify | 🎁 Rewards
+3. On Verify, bot checks channel membership via the Telegram API and
+   credits whoever referred them. Each verified referral adds 1 to the
+   user's referral BALANCE — nothing is auto-delivered anymore.
+4. Rewards each have their own referral cost (e.g. "Canva Pro — 1 Year"
+   might cost 4 referrals, a promo code might cost 0). The user opens
+   🎁 Rewards any time to see their balance and what they can afford.
+5. Tapping a reward:
+   - Free/instant items (url/file/code/text with cost 0) deliver right
+     away, same as before.
+   - Anything with a cost checks the user's balance first. If they can
+     afford it, the cost is deducted from their balance.
+   - Items of type "redeem" (the new type — use this for anything you
+     fulfill by hand, like Canva Pro) then ask the user for their email.
+     The email + product + cost gets logged to your local redemptions
+     table, appended to a Google Sheet if you've set one up (see
+     GOOGLE_SHEETS_SETUP.md), AND sent to you instantly on Telegram —
+     so you can go deliver it.
 
 Admin control panel:
 - Send /admin (or tap the "🛠 Admin Panel" button that only you see on /start)
   to open a button-driven control panel. From it you can, without touching
   code or redeploying:
     - view stats
-    - add/remove referrals for a user
+    - add/remove referral balance for a user
     - change the channel link / channel ID
     - change the greeting message and the task message
-    - change how many referrals are required
-    - add, remove, or replace the reward buttons users unlock (links,
-      files, tap-to-copy codes, or plain text)
+    - add, remove, or replace the rewards users can redeem (links, files,
+      tap-to-copy codes, plain text, or "redeem" items that collect an
+      email for you to fulfill by hand) — each with its own referral cost
+    - see pending redemptions and mark them fulfilled once you've sent
+      the product
+    - export every redemption ever logged as a CSV file, any time
   You never have to type a slash command with arguments again — every admin
   action is a button, and the bot asks you for the one piece of info it
   still needs (e.g. "send the new link").
@@ -33,16 +48,23 @@ Beginner notes:
 - User data AND all the admin-editable settings above live in a local
   SQLite file (bot_data.db), created automatically. IMPORTANT if you're on
   Render's free plan: that file lives on an ephemeral disk, which is wiped
-  every time the service redeploys or spins back up after going idle. See
-  the note in the README about keeping data across restarts.
+  every time the service redeploys or spins back up after going idle.
+  That's exactly why redemptions (the ones that matter — email + product)
+  get sent to you on Telegram immediately AND (optionally) to a Google
+  Sheet that lives outside Render entirely. See GOOGLE_SHEETS_SETUP.md.
 """
 
-import os
+import asyncio
+import csv
 import html
+import io
 import json
 import logging
+import os
+import re
 import secrets
 import threading
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import sqlite3
@@ -66,6 +88,8 @@ from telegram.ext import (
     filters,
 )
 
+import sheets
+
 # --------------------------------------------------------------------------
 # Config (loaded from .env) — these are the STARTUP defaults. Everything
 # marked "admin-editable" below can be changed later from inside Telegram
@@ -78,8 +102,7 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 CHANNEL_ID_ENV = os.getenv("CHANNEL_ID")                       # admin-editable
 CHANNEL_INVITE_LINK_ENV = os.getenv("CHANNEL_INVITE_LINK")     # admin-editable
-REQUIRED_REFERRALS_ENV = int(os.getenv("REQUIRED_REFERRALS", "2"))  # admin-editable
-SERVICES_ENV_RAW = os.getenv("SERVICES", "")                   # admin-editable
+SERVICES_ENV_RAW = os.getenv("SERVICES", "")                   # admin-editable (this is the REWARDS list)
 
 SERVICE_TYPE = os.getenv("SERVICE_TYPE", "text")     # legacy single-item fallback
 SERVICE_TEXT = os.getenv("SERVICE_TEXT", "Here is your service/link!")
@@ -90,11 +113,15 @@ BOT_DISPLAY_NAME = "DesignerDebBot"
 
 DEFAULT_GREETING = f"👋 Hey {{first_name}}! Welcome to {BOT_DISPLAY_NAME}."
 DEFAULT_TASK = (
-    "Here's what you need to do to get your reward:\n"
+    "Here's what you need to do:\n"
     "1️⃣ Join our channel\n"
-    "2️⃣ Refer at least {required} friends (they must join & verify too)\n\n"
+    "2️⃣ Refer friends — they must join & verify too\n"
+    "3️⃣ Every verified referral adds to your balance\n\n"
+    "Once you've got enough, open 🎁 Rewards to redeem something!\n\n"
     "Tap the buttons below 👇"
 )
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 if not BOT_TOKEN or not CHANNEL_ID_ENV or not CHANNEL_INVITE_LINK_ENV:
     raise SystemExit(
@@ -143,8 +170,7 @@ def init_db():
             username TEXT,
             referred_by INTEGER,
             referral_count INTEGER DEFAULT 0,
-            verified_join INTEGER DEFAULT 0,
-            got_service INTEGER DEFAULT 0
+            verified_join INTEGER DEFAULT 0
         )
         """
     )
@@ -158,17 +184,41 @@ def init_db():
         )
         """
     )
+    # One row per redemption request (the "needs email / manual fulfillment"
+    # kind, plus a record of instant/free deliveries for the stats count).
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS redemptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT,
+            reward_id TEXT,
+            reward_label TEXT,
+            cost INTEGER,
+            email TEXT,
+            status TEXT DEFAULT 'pending',
+            created_at TEXT
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
 
 def get_user(user_id: int):
+    """Returns (user_id, username, referred_by, referral_count, verified_join)
+    or None. Selects columns explicitly (not SELECT *) so this keeps working
+    even against an older DB file that still has a leftover legacy column."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+    c.execute(
+        "SELECT user_id, username, referred_by, referral_count, verified_join "
+        "FROM users WHERE user_id=?",
+        (user_id,),
+    )
     row = c.fetchone()
     conn.close()
-    return row  # (user_id, username, referred_by, referral_count, verified_join, got_service)
+    return row
 
 
 def add_user(user_id: int, username: str, referred_by: int | None = None):
@@ -202,22 +252,15 @@ def increment_referral(referrer_id: int):
 
 
 def add_referral_count(user_id: int, amount: int):
-    """Adds (or subtracts, if amount is negative) to a user's referral count.
-    Never lets it go below 0."""
+    """Adds (or subtracts, if amount is negative) to a user's referral
+    balance. Never lets it go below 0 — this is also how redeeming a
+    reward deducts its cost."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
         "UPDATE users SET referral_count = MAX(referral_count + ?, 0) WHERE user_id=?",
         (amount, user_id),
     )
-    conn.commit()
-    conn.close()
-
-
-def set_got_service(user_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("UPDATE users SET got_service=1 WHERE user_id=?", (user_id,))
     conn.commit()
     conn.close()
 
@@ -229,10 +272,70 @@ def build_stats_text() -> str:
     total = c.fetchone()[0]
     c.execute("SELECT COUNT(*) FROM users WHERE verified_join=1")
     verified = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM users WHERE got_service=1")
-    unlocked = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM redemptions")
+    total_redemptions = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM redemptions WHERE status='pending'")
+    pending = c.fetchone()[0]
     conn.close()
-    return f"📊 Stats\nTotal users: {total}\nVerified joins: {verified}\nUnlocked service: {unlocked}"
+    return (
+        "📊 Stats\n"
+        f"Total users: {total}\n"
+        f"Verified joins: {verified}\n"
+        f"Total redemptions: {total_redemptions}\n"
+        f"Pending fulfillment: {pending}"
+    )
+
+
+# --------------------------------------------------------------------------
+# Redemption log helpers (the "needs email / you fulfill by hand" queue)
+# --------------------------------------------------------------------------
+def create_redemption(user_id, username, reward_id, reward_label, cost, email, status) -> int:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT INTO redemptions (user_id, username, reward_id, reward_label, cost, email, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (user_id, username, reward_id, reward_label, cost, email, status, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    new_id = c.lastrowid
+    conn.close()
+    return new_id
+
+
+def get_recent_redemptions(limit: int = 10, status: str | None = None):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    if status:
+        c.execute("SELECT * FROM redemptions WHERE status=? ORDER BY id DESC LIMIT ?", (status, limit))
+    else:
+        c.execute("SELECT * FROM redemptions ORDER BY id DESC LIMIT ?", (limit,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def get_all_redemptions():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT * FROM redemptions ORDER BY id ASC")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def set_redemption_status(redemption_id: int, status: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE redemptions SET status=? WHERE id=?", (status, redemption_id))
+    conn.commit()
+    conn.close()
+
+
+def is_valid_email(text: str) -> bool:
+    return bool(EMAIL_RE.match(text.strip()))
 
 
 # --------------------------------------------------------------------------
@@ -259,7 +362,7 @@ def set_setting(key: str, value: str):
     conn.close()
 
 
-# Registry of the simple text/number fields an admin can edit from the panel.
+# Registry of the simple text fields an admin can edit from the panel.
 # "setting_key" is where it's stored; "default_env" is what it falls back to
 # until the admin changes it for the first time.
 EDITABLE_FIELDS = {
@@ -284,14 +387,8 @@ EDITABLE_FIELDS = {
     "task": {
         "setting_key": "task_text",
         "label": "📋 Task Message",
-        "prompt": "Send the new task/instructions message. You can use {required} for the referral count:",
+        "prompt": "Send the new task/instructions message:",
         "default_env": DEFAULT_TASK,
-    },
-    "required": {
-        "setting_key": "required_referrals",
-        "label": "🔢 Required Referrals",
-        "prompt": "Send the number of referrals required (whole number, e.g. 2):",
-        "default_env": str(REQUIRED_REFERRALS_ENV),
     },
 }
 
@@ -302,17 +399,25 @@ def get_field_value(field_key: str) -> str:
 
 
 # --------------------------------------------------------------------------
-# Reward-button ("services") helpers
+# Reward helpers (stored under the same "services_json" setting key /
+# SERVICES env var as before, just with an added "cost" field, so an
+# already-deployed bot doesn't lose anything configured previously).
 # --------------------------------------------------------------------------
-def parse_services_string(raw: str):
+def parse_rewards_string(raw: str):
     """
-    Turns a "Label|type|value;Label|type|value" string into a list of dicts.
-    type is one of: url, file, code, text
-      url  -> tapping opens the link immediately (no bot round-trip)
-      file -> tapping sends a file. value is either a path in your repo, or
-              (once an admin uploads a file through the panel) "tg:<file_id>"
-      code -> tapping sends the value as a tap-to-copy code block
-      text -> tapping sends the value as a plain message
+    Turns "Label|type|value|cost;Label|type|value|cost" into a list of dicts.
+    cost is optional per item (defaults to 0) — old 3-part entries still work.
+      type = url    -> tapping opens the link immediately (free items only;
+                        anything with cost > 0 routes through the bot instead)
+      type = file   -> tapping sends a file. value = repo path, or (once an
+                        admin uploads a file through the panel) "tg:<file_id>"
+      type = code   -> tapping sends the value as a tap-to-copy code block
+      type = text   -> tapping sends the value as a plain message
+      type = redeem -> tapping asks the user for their email, then logs the
+                        request (email + product) for you to fulfill by hand
+                        — use this for anything like Canva Pro that needs a
+                        human to actually deliver it
+      cost = how many referrals this item costs. 0 = free/instant.
     """
     items = []
     for chunk in raw.split(";"):
@@ -320,35 +425,50 @@ def parse_services_string(raw: str):
         if not chunk:
             continue
         parts = [p.strip() for p in chunk.split("|")]
-        if len(parts) != 3:
-            logger.warning("Skipping malformed SERVICES entry: %r", chunk)
+        if len(parts) not in (3, 4):
+            logger.warning("Skipping malformed reward entry: %r", chunk)
             continue
-        label, s_type, value = parts
-        if s_type not in ("url", "file", "code", "text"):
-            logger.warning("Skipping SERVICES entry with unknown type: %r", chunk)
+        label, r_type, value = parts[0], parts[1], parts[2]
+        cost_str = parts[3] if len(parts) == 4 else "0"
+        if r_type not in ("url", "file", "code", "text", "redeem"):
+            logger.warning("Skipping reward entry with unknown type: %r", chunk)
             continue
-        items.append({"id": secrets.token_hex(3), "label": label, "type": s_type, "value": value})
+        if not cost_str.isdigit():
+            logger.warning("Skipping reward entry with a bad cost: %r", chunk)
+            continue
+        items.append(
+            {
+                "id": secrets.token_hex(3),
+                "label": label,
+                "type": r_type,
+                "value": value,
+                "cost": int(cost_str),
+            }
+        )
     return items
 
 
-def services_to_raw_string(services) -> str:
-    return ";".join(f"{s['label']}|{s['type']}|{s['value']}" for s in services)
+def rewards_to_raw_string(rewards) -> str:
+    return ";".join(f"{r['label']}|{r['type']}|{r['value']}|{r.get('cost', 0)}" for r in rewards)
 
 
-def get_services():
+def get_rewards():
     raw = get_setting("services_json", "")
     if raw:
         try:
-            return json.loads(raw)
+            rewards = json.loads(raw)
+            for r in rewards:
+                r.setdefault("cost", 0)  # migrate any old entries saved with no cost field
+            return rewards
         except json.JSONDecodeError:
             logger.error("Corrupt services_json in settings — reseeding from .env SERVICES.")
-    seeded = parse_services_string(SERVICES_ENV_RAW)
-    save_services(seeded)
+    seeded = parse_rewards_string(SERVICES_ENV_RAW)
+    save_rewards(seeded)
     return seeded
 
 
-def save_services(services):
-    set_setting("services_json", json.dumps(services))
+def save_rewards(rewards):
+    set_setting("services_json", json.dumps(rewards))
 
 
 # --------------------------------------------------------------------------
@@ -359,6 +479,7 @@ def start_keyboard(user_id: int):
         [InlineKeyboardButton("📢 Channel", url=get_field_value("channel_link"))],
         [InlineKeyboardButton("🔗 Referral Link", callback_data="show_ref")],
         [InlineKeyboardButton("✅ Verify", callback_data="verify")],
+        [InlineKeyboardButton("🎁 Rewards", callback_data="show_rewards")],
     ]
     if user_id == ADMIN_ID:
         rows.append([InlineKeyboardButton("🛠 Admin Panel", callback_data="adm:menu")])
@@ -367,19 +488,31 @@ def start_keyboard(user_id: int):
 
 def recheck_keyboard():
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🔄 Check Again", callback_data="verify")]]
+        [
+            [InlineKeyboardButton("🔄 Check Again", callback_data="verify")],
+            [InlineKeyboardButton("🎁 Rewards", callback_data="show_rewards")],
+        ]
     )
 
 
-def service_keyboard(services):
-    """One tappable button per reward item. 'url' buttons open instantly;
-    'file'/'code'/'text' buttons trigger the bot to send that item on tap."""
+def reward_keyboard(rewards, balance: int):
+    """One button per reward. A free 'url' item opens instantly with no bot
+    round-trip; everything else (including any item with a cost) routes
+    through the bot so it can check the user's balance first."""
     rows = []
-    for svc in services:
-        if svc["type"] == "url":
-            rows.append([InlineKeyboardButton(svc["label"], url=svc["value"])])
+    for r in rewards:
+        cost = r.get("cost", 0)
+        if r["type"] == "url" and cost == 0:
+            rows.append([InlineKeyboardButton(r["label"], url=r["value"])])
+            continue
+        if cost > 0:
+            if balance >= cost:
+                text = f"🎁 {r['label']} — Redeem ({cost} 👥)"
+            else:
+                text = f"🔒 {r['label']} — needs {cost} 👥 (you have {balance})"
         else:
-            rows.append([InlineKeyboardButton(svc["label"], callback_data=f"get_{svc['id']}")])
+            text = f"🎁 {r['label']} (free)"
+        rows.append([InlineKeyboardButton(text, callback_data=f"redeem_{r['id']}")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -396,8 +529,11 @@ def admin_menu_keyboard():
                 InlineKeyboardButton("👋 Greeting", callback_data="adm:edit:greeting"),
                 InlineKeyboardButton("📋 Task Text", callback_data="adm:edit:task"),
             ],
-            [InlineKeyboardButton("🔢 Required Referrals", callback_data="adm:edit:required")],
-            [InlineKeyboardButton("🎁 Reward Buttons", callback_data="adm:services")],
+            [InlineKeyboardButton("🎁 Rewards", callback_data="adm:services")],
+            [
+                InlineKeyboardButton("📜 Redemptions", callback_data="adm:redemptions"),
+                InlineKeyboardButton("📁 Export CSV", callback_data="adm:export"),
+            ],
         ]
     )
 
@@ -406,30 +542,52 @@ def cancel_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="adm:cancel")]])
 
 
-def services_menu_keyboard(services):
+def rewards_menu_keyboard(rewards):
     rows = [
-        [InlineKeyboardButton(f"🗑 {s['label']}", callback_data=f"adm:svcrm:{s['id']}")]
-        for s in services
+        [InlineKeyboardButton(f"🗑 {r['label']} ({r.get('cost', 0)} 👥)", callback_data=f"adm:svcrm:{r['id']}")]
+        for r in rewards
     ]
-    rows.append([InlineKeyboardButton("➕ Add New Item", callback_data="adm:svcadd")])
+    rows.append([InlineKeyboardButton("➕ Add New Reward", callback_data="adm:svcadd")])
     rows.append([InlineKeyboardButton("📋 Replace All (paste list)", callback_data="adm:svcreplace")])
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data="adm:menu")])
     return InlineKeyboardMarkup(rows)
 
 
-def svc_type_keyboard():
+def reward_type_keyboard():
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("🔗 URL (opens instantly)", callback_data="adm:svctype:url")],
+            [InlineKeyboardButton("🔗 URL (opens instantly if free)", callback_data="adm:svctype:url")],
             [InlineKeyboardButton("📄 File", callback_data="adm:svctype:file")],
             [InlineKeyboardButton("🎟 Code (tap-to-copy)", callback_data="adm:svctype:code")],
             [InlineKeyboardButton("💬 Text", callback_data="adm:svctype:text")],
+            [InlineKeyboardButton("🎯 Redeem (collects email, you fulfill)", callback_data="adm:svctype:redeem")],
         ]
     )
 
 
-def services_listing_text(services) -> str:
-    return "\n".join(f"• {s['label']} ({s['type']})" for s in services) or "(none yet)"
+def rewards_listing_text(rewards) -> str:
+    lines = []
+    for r in rewards:
+        cost = r.get("cost", 0)
+        cost_label = f"{cost} referrals" if cost else "free"
+        lines.append(f"• {r['label']} — {r['type']}, {cost_label}")
+    return "\n".join(lines) or "(none yet)"
+
+
+def redemptions_panel_content(limit: int = 10):
+    rows = get_recent_redemptions(limit=limit, status="pending")
+    if not rows:
+        return "📜 No pending redemptions right now.", admin_menu_keyboard()
+    lines = ["📜 Pending Redemptions (most recent first):\n"]
+    keyboard_rows = []
+    for r in rows:
+        rid, user_id, username, reward_id, reward_label, cost, email, status, created_at = r
+        lines.append(f"#{rid} • @{username or user_id} • {reward_label} • {email}")
+        keyboard_rows.append(
+            [InlineKeyboardButton(f"✅ Mark #{rid} fulfilled", callback_data=f"adm:fulfill:{rid}")]
+        )
+    keyboard_rows.append([InlineKeyboardButton("⬅️ Back", callback_data="adm:menu")])
+    return "\n".join(lines), InlineKeyboardMarkup(keyboard_rows)
 
 
 # --------------------------------------------------------------------------
@@ -450,16 +608,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if get_user(user.id) is None:
         add_user(user.id, user.username or user.first_name, referred_by)
 
-    required = int(get_field_value("required"))
-
     try:
         greeting = get_field_value("greeting").format(first_name=user.first_name)
     except (KeyError, IndexError):
         greeting = get_field_value("greeting")  # admin text had a stray "{...}" — show it raw
-    try:
-        task = get_field_value("task").format(required=required)
-    except (KeyError, IndexError):
-        task = get_field_value("task")
+    task = get_field_value("task")
 
     text = f"{greeting}\n\n{task}"
     await update.message.reply_text(text, reply_markup=start_keyboard(user.id))
@@ -514,7 +667,7 @@ async def verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
         add_user(user.id, user.username or user.first_name)
         row = get_user(user.id)
 
-    _, _, referred_by, _, was_verified, _ = row
+    _, _, referred_by, _, was_verified = row
 
     # 3. First time verifying? Credit whoever referred them.
     if not was_verified:
@@ -525,116 +678,153 @@ async def verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(
                     referred_by,
                     "🎉 One of your referrals just joined and verified! "
-                    "Keep sharing your link.",
+                    "Keep sharing your link — every one gets you closer to your next reward.",
                 )
             except TelegramError:
                 pass  # referrer may have blocked the bot
 
-    # 4. Re-read fresh referral count and decide what to show
+    # 4. Show the user their (fresh) balance and point them at the shop
     row = get_user(user.id)
-    _, _, _, referral_count, _, got_service = row
-    required = int(get_field_value("required"))
+    _, _, _, balance, _ = row
+    text = (
+        "✅ Channel join verified!\n\n"
+        f"👥 Your referral balance: {balance}\n\n"
+        "Tap 🎁 Rewards to see what you can redeem, or keep sharing your referral "
+        "link to earn more."
+    )
+    await query.edit_message_text(text, reply_markup=recheck_keyboard())
 
-    if referral_count >= required:
-        await query.edit_message_text(
-            f"✅ Verified! You referred {referral_count}/{required} friends.\n\n"
-            f"Delivering your service now… 👇"
-        )
-        if not got_service:
-            set_got_service(user.id)
-        await deliver_service(context, user.id)
+
+async def render_rewards(user, target, edit: bool):
+    """Shared by the 🎁 Rewards button and the /rewards command."""
+    row = get_user(user.id)
+    if row is None:
+        add_user(user.id, user.username or user.first_name)
+        row = get_user(user.id)
+    _, _, _, balance, verified = row
+
+    rewards = get_rewards()
+    if not rewards:
+        text = "🎁 No rewards are configured yet — check back soon!"
+        markup = None
     else:
-        bot_username = (await context.bot.get_me()).username
-        ref_link = f"https://t.me/{bot_username}?start=ref{user.id}"
-        text = (
-            f"✅ Channel join verified!\n\n"
-            f"👥 Referrals: {referral_count}/{required}\n\n"
-            f"Share your personal link with friends, then tap Check Again:\n{ref_link}"
-        )
-        await query.edit_message_text(text, reply_markup=recheck_keyboard())
+        lines = [f"👥 Your referral balance: {balance}"]
+        if not verified:
+            lines.append("⚠️ Join the channel and tap ✅ Verify first to unlock redeeming.")
+        lines.append("\nTap a reward to redeem it:")
+        text = "\n".join(lines)
+        markup = reward_keyboard(rewards, balance)
+
+    if edit:
+        await target.edit_message_text(text, reply_markup=markup)
+    else:
+        await target.reply_text(text, reply_markup=markup)
 
 
-async def deliver_service(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
-    """Sends the actual product. Uses tappable buttons if any reward items
-    are configured, otherwise falls back to the old single text/file
-    behavior. Returns True if it was sent successfully, False otherwise."""
-    services = get_services()
-    try:
-        if services:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text="🎉 You're all set! Tap below to access your service:",
-                reply_markup=service_keyboard(services),
-            )
-        elif SERVICE_TYPE == "file" and SERVICE_FILE_PATH:
-            with open(SERVICE_FILE_PATH, "rb") as f:
-                await context.bot.send_document(chat_id=user_id, document=f, caption=SERVICE_TEXT)
-        else:
-            await context.bot.send_message(
-                chat_id=user_id, text=SERVICE_TEXT, parse_mode=ParseMode.HTML
-            )
-        return True
-    except TelegramError as e:
-        logger.error("Failed to deliver service to %s: %s", user_id, e)
-        return False
-
-
-async def get_service_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles taps on a 'file' / 'code' / 'text' reward button."""
+async def show_rewards_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    user = query.from_user
+    await query.answer()
+    await render_rewards(query.from_user, query, edit=True)
 
-    # Defense in depth: re-check eligibility even though only this user
-    # can tap buttons inside their own private chat with the bot.
-    row = get_user(user.id)
-    required = int(get_field_value("required"))
-    if row is None or not row[4] or row[3] < required:
-        await query.answer("⚠️ You need to verify and complete your referrals first.", show_alert=True)
-        return
 
-    svc_id = query.data.removeprefix("get_")
-    services = get_services()
-    svc = next((s for s in services if s["id"] == svc_id), None)
-    if svc is None:
-        await query.answer("⚠️ That item isn't available anymore.", show_alert=True)
-        return
+async def rewards_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await render_rewards(update.effective_user, update.message, edit=False)
 
-    await query.answer()  # dismiss the loading spinner on the button
 
+async def deliver_reward_item(context: ContextTypes.DEFAULT_TYPE, user_id: int, reward) -> bool:
+    """Instantly delivers a url/file/code/text reward. Returns True on
+    success. ('redeem' items never reach this — they go through the
+    email-collection flow instead.)"""
     try:
-        if svc["type"] == "file":
-            value = svc["value"]
+        if reward["type"] == "file":
+            value = reward["value"]
             if value.startswith("tg:"):
                 # Uploaded through the admin panel — Telegram hosts the file
                 # itself, so this works even after the bot's disk is wiped.
-                await context.bot.send_document(chat_id=user.id, document=value[3:], caption=svc["label"])
+                await context.bot.send_document(chat_id=user_id, document=value[3:], caption=reward["label"])
             else:
                 with open(value, "rb") as f:
-                    await context.bot.send_document(chat_id=user.id, document=f, caption=svc["label"])
-        elif svc["type"] == "code":
+                    await context.bot.send_document(chat_id=user_id, document=f, caption=reward["label"])
+        elif reward["type"] == "code":
             # Wrapped in <code> so Telegram shows a tap-to-copy monospace block.
-            safe_value = html.escape(svc["value"])
+            safe_value = html.escape(reward["value"])
             await context.bot.send_message(
-                chat_id=user.id, text=f"<code>{safe_value}</code>", parse_mode=ParseMode.HTML
+                chat_id=user_id, text=f"<code>{safe_value}</code>", parse_mode=ParseMode.HTML
             )
-        else:  # "text"
-            await context.bot.send_message(chat_id=user.id, text=svc["value"])
+        elif reward["type"] == "text":
+            await context.bot.send_message(chat_id=user_id, text=reward["value"])
+        elif reward["type"] == "url":
+            # Only reached here when cost > 0 — free url items open directly
+            # as a link button and never hit this function.
+            await context.bot.send_message(chat_id=user_id, text=f"🔗 {reward['label']}:\n{reward['value']}")
+        return True
     except (TelegramError, FileNotFoundError) as e:
-        logger.error("Failed to deliver service item %s to %s: %s", svc_id, user.id, e)
+        logger.error("Failed to deliver reward %s to %s: %s", reward.get("id"), user_id, e)
         await context.bot.send_message(
-            chat_id=user.id, text="⚠️ Something went wrong delivering that. Please try again shortly."
+            chat_id=user_id,
+            text="⚠️ Something went wrong delivering that. Please try again shortly, or contact the admin.",
         )
+        return False
+
+
+async def redeem_reward(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles taps on a reward button (anything routed through the bot —
+    i.e. everything except a free 'url' item)."""
+    query = update.callback_query
+    user = query.from_user
+
+    row = get_user(user.id)
+    if row is None:
+        await query.answer("Please tap /start first.", show_alert=True)
+        return
+    _, username, _, balance, verified = row
+    if not verified:
+        await query.answer("⚠️ Join the channel and tap ✅ Verify first.", show_alert=True)
+        return
+
+    reward_id = query.data.removeprefix("redeem_")
+    rewards = get_rewards()
+    reward = next((r for r in rewards if r["id"] == reward_id), None)
+    if reward is None:
+        await query.answer("⚠️ That reward isn't available anymore.", show_alert=True)
+        return
+
+    cost = reward.get("cost", 0)
+    if balance < cost:
+        await query.answer(
+            f"🔒 You need {cost - balance} more referral(s) for this. You have {balance}/{cost}.",
+            show_alert=True,
+        )
+        return
+
+    await query.answer()
+
+    if reward["type"] == "redeem":
+        # Don't deduct yet — only once we actually have a valid email, so an
+        # abandoned flow never costs the user anything.
+        context.user_data["awaiting_email_for"] = reward_id
+        await context.bot.send_message(
+            chat_id=user.id,
+            text=(
+                f"🎁 Redeeming: {reward['label']}\n"
+                f"Cost: {cost} referral(s)\n\n"
+                "📧 Please reply with the email address we should deliver it to.\n"
+                "(Send /cancel to back out — nothing is deducted yet.)"
+            ),
+        )
+        return
+
+    # Instant items (url/file/code/text) — deliver right away, then deduct.
+    delivered = await deliver_reward_item(context, user.id, reward)
+    if delivered and cost > 0:
+        add_referral_count(user.id, -cost)
+        create_redemption(user.id, username, reward["id"], reward["label"], cost, "", "auto_delivered")
 
 
 async def my_service(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lets an already-unlocked user re-summon their service buttons any time."""
-    user = update.effective_user
-    row = get_user(user.id)
-    required = int(get_field_value("required"))
-    if row is None or not row[4] or row[3] < required:
-        await update.message.reply_text("You haven't unlocked the service yet. Send /start to begin.")
-        return
-    await deliver_service(context, user.id)
+    """Legacy alias for /rewards, kept so anyone used to the old command
+    name doesn't hit a dead end."""
+    await rewards_command(update, context)
 
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -657,6 +847,19 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Tap a button below. Changes apply immediately — no redeploy needed.",
         reply_markup=admin_menu_keyboard(),
     )
+
+
+async def export_redemptions_csv(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    rows = get_all_redemptions()
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(
+        ["id", "user_id", "username", "reward_id", "reward_label", "cost", "email", "status", "created_at"]
+    )
+    writer.writerows(rows)
+    data = io.BytesIO(buf.getvalue().encode("utf-8"))
+    data.name = "redemptions.csv"
+    await context.bot.send_document(chat_id=chat_id, document=data, filename="redemptions.csv")
 
 
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -703,27 +906,27 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif action == "services":
-        services = get_services()
+        rewards = get_rewards()
         await query.edit_message_text(
-            f"🎁 Reward Buttons\n{services_listing_text(services)}\n\n"
+            f"🎁 Rewards\n{rewards_listing_text(rewards)}\n\n"
             "Tap an item to remove it, or use the buttons below.",
-            reply_markup=services_menu_keyboard(services),
+            reply_markup=rewards_menu_keyboard(rewards),
         )
 
     elif action == "svcrm":
         svc_id = parts[2]
-        services = [s for s in get_services() if s["id"] != svc_id]
-        save_services(services)
+        rewards = [r for r in get_rewards() if r["id"] != svc_id]
+        save_rewards(rewards)
         await query.edit_message_text(
-            f"🗑 Removed.\n\n🎁 Reward Buttons\n{services_listing_text(services)}",
-            reply_markup=services_menu_keyboard(services),
+            f"🗑 Removed.\n\n🎁 Rewards\n{rewards_listing_text(rewards)}",
+            reply_markup=rewards_menu_keyboard(rewards),
         )
 
     elif action == "svcadd":
         context.user_data["svc_new"] = {}
         context.user_data["awaiting"] = "svc_label"
         await query.edit_message_text(
-            "Send the button label for the new reward item (e.g. 🔗 Premium Link):\n\n"
+            "Send the button label for the new reward (e.g. 🎨 Canva Pro — 1 Year):\n\n"
             "(Send /cancel to abort.)",
             reply_markup=cancel_keyboard(),
         )
@@ -741,40 +944,48 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         elif svc_type == "code":
             prompt = "Send the code/text to deliver as a tap-to-copy block:"
+        elif svc_type == "redeem":
+            prompt = (
+                "Send a short product name/description (e.g. 'Canva Pro — 1 Year "
+                "Subscription'). This is what you'll see in the spreadsheet and "
+                "in the Telegram notification:"
+            )
         else:
             prompt = "Send the plain text message to deliver:"
         await query.edit_message_text(f"{prompt}\n\n(Send /cancel to abort.)", reply_markup=cancel_keyboard())
 
     elif action == "svcreplace":
         context.user_data["awaiting"] = "svc_replace_raw"
-        raw_current = services_to_raw_string(get_services())
+        raw_current = rewards_to_raw_string(get_rewards())
         await query.edit_message_text(
             "Paste the FULL replacement list, in this format:\n"
-            "Label|type|value;Label|type|value\n"
-            "(type = url, file, code, or text)\n\n"
+            "Label|type|value|cost;Label|type|value|cost\n"
+            "(type = url, file, code, text, or redeem — cost = referrals required, 0 = free)\n\n"
             f"Current:\n{raw_current or '(none)'}\n\n"
             "(Send /cancel to abort.)",
             reply_markup=cancel_keyboard(),
         )
 
+    elif action == "redemptions":
+        text, markup = redemptions_panel_content()
+        await query.edit_message_text(text, reply_markup=markup)
 
-async def admin_flow_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Captures the admin's next text/file message when the panel is
-    waiting on a value (e.g. after tapping 'Channel Link' or 'Add Item').
-    Does nothing for non-admins or when no edit flow is in progress."""
-    if update.effective_user.id != ADMIN_ID:
-        return
-    awaiting = context.user_data.get("awaiting")
-    if not awaiting:
-        return
+    elif action == "fulfill":
+        rid = int(parts[2])
+        set_redemption_status(rid, "fulfilled")
+        text, markup = redemptions_panel_content()
+        await query.edit_message_text(text, reply_markup=markup)
 
+    elif action == "export":
+        await query.edit_message_text("📁 Building your CSV export…", reply_markup=admin_menu_keyboard())
+        await export_redemptions_csv(context, query.from_user.id)
+
+
+async def handle_admin_awaiting(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    """Handles the admin's next text/file reply while a panel flow (edit,
+    add referral, add/replace reward) is waiting on a value."""
     message = update.message
-    text = (message.text or message.caption or "").strip()
-
-    if text == "/cancel":
-        context.user_data.clear()
-        await message.reply_text("Cancelled.", reply_markup=admin_menu_keyboard())
-        return
+    awaiting = context.user_data.get("awaiting")
 
     if awaiting == "addref":
         parts = text.split()
@@ -792,24 +1003,12 @@ async def admin_flow_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if get_user(target_id) is None:
             add_user(target_id, "unknown")
         add_referral_count(target_id, amount)
-        _, _, _, referral_count, verified_join, got_service = get_user(target_id)
+        _, _, _, balance, _ = get_user(target_id)
         context.user_data.clear()
         await message.reply_text(
-            f"✅ User {target_id} now has {referral_count} referral(s).",
+            f"✅ User {target_id} now has {balance} referral(s).",
             reply_markup=admin_menu_keyboard(),
         )
-
-        required = int(get_field_value("required"))
-        if verified_join and referral_count >= required and not got_service:
-            set_got_service(target_id)
-            delivered = await deliver_service(context, target_id)
-            if delivered:
-                await message.reply_text(f"🎉 Service auto-delivered to {target_id}.")
-            else:
-                await message.reply_text(
-                    f"⚠️ Couldn't message {target_id} directly — they probably haven't "
-                    f"started a chat with the bot yet."
-                )
         return
 
     if awaiting.startswith("edit:"):
@@ -817,9 +1016,6 @@ async def admin_flow_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         field = EDITABLE_FIELDS.get(field_key)
         if not field:
             context.user_data.clear()
-            return
-        if field_key == "required" and not text.isdigit():
-            await message.reply_text("Please send a whole number (e.g. 2).")
             return
         set_setting(field["setting_key"], text)
         context.user_data.clear()
@@ -829,7 +1025,7 @@ async def admin_flow_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if awaiting == "svc_label":
         context.user_data.setdefault("svc_new", {})["label"] = text
         context.user_data["awaiting"] = "svc_type"
-        await message.reply_text("Now pick the type:", reply_markup=svc_type_keyboard())
+        await message.reply_text("Now pick the type:", reply_markup=reward_type_keyboard())
         return
 
     if awaiting == "svc_type":
@@ -847,24 +1043,40 @@ async def admin_flow_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             value = text
         svc_new["value"] = value
+        context.user_data["awaiting"] = "svc_cost"
+        prompt = (
+            "How many referrals should this cost? Send a whole number (redeem "
+            "items normally cost more than 0):"
+            if svc_type == "redeem"
+            else "How many referrals should this cost? Send a whole number (0 = free/instant delivery):"
+        )
+        await message.reply_text(prompt, reply_markup=cancel_keyboard())
+        return
+
+    if awaiting == "svc_cost":
+        if not text.isdigit():
+            await message.reply_text("Please send a whole number, e.g. 3.")
+            return
+        svc_new = context.user_data.get("svc_new", {})
+        svc_new["cost"] = int(text)
         svc_new["id"] = secrets.token_hex(3)
-        services = get_services()
-        services.append(svc_new)
-        save_services(services)
+        rewards = get_rewards()
+        rewards.append(svc_new)
+        save_rewards(rewards)
         context.user_data.clear()
         await message.reply_text(
-            f"✅ Added.\n\n🎁 Reward Buttons\n{services_listing_text(services)}",
-            reply_markup=services_menu_keyboard(services),
+            f"✅ Added.\n\n🎁 Rewards\n{rewards_listing_text(rewards)}",
+            reply_markup=rewards_menu_keyboard(rewards),
         )
         return
 
     if awaiting == "svc_replace_raw":
-        new_services = parse_services_string(text)
-        save_services(new_services)
+        new_rewards = parse_rewards_string(text)
+        save_rewards(new_rewards)
         context.user_data.clear()
         await message.reply_text(
-            f"✅ Reward buttons replaced.\n\n🎁 Reward Buttons\n{services_listing_text(new_services)}",
-            reply_markup=services_menu_keyboard(new_services),
+            f"✅ Rewards replaced.\n\n🎁 Rewards\n{rewards_listing_text(new_rewards)}",
+            reply_markup=rewards_menu_keyboard(new_rewards),
         )
         return
 
@@ -872,8 +1084,103 @@ async def admin_flow_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
 
 
+async def handle_redeem_email(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    """Handles a user's reply while the bot is waiting for their email to
+    finish a 'redeem' reward. Deducts the balance, logs the request, and
+    notifies the admin — only once we have a valid email in hand."""
+    user = update.effective_user
+    message = update.message
+    reward_id = context.user_data.get("awaiting_email_for")
+
+    if not is_valid_email(text):
+        await message.reply_text("That doesn't look like a valid email address. Please try again, or send /cancel.")
+        return
+
+    email = text.strip()
+    rewards = get_rewards()
+    reward = next((r for r in rewards if r["id"] == reward_id), None)
+    if reward is None:
+        context.user_data.clear()
+        await message.reply_text("⚠️ That reward isn't available anymore. Nothing was deducted.")
+        return
+
+    row = get_user(user.id)
+    _, username, _, balance, _ = row
+    cost = reward.get("cost", 0)
+    if balance < cost:
+        context.user_data.clear()
+        await message.reply_text(
+            f"⚠️ Your balance changed and you no longer have enough referrals for this "
+            f"({balance}/{cost}). Nothing was deducted."
+        )
+        return
+
+    add_referral_count(user.id, -cost)
+    redemption_id = create_redemption(user.id, username, reward["id"], reward["label"], cost, email, "pending")
+    context.user_data.clear()
+
+    new_balance = balance - cost
+    await message.reply_text(
+        "✅ Request received!\n\n"
+        f"🎁 {reward['label']}\n"
+        f"📧 {email}\n\n"
+        f"We'll deliver it to that email soon. Your remaining balance: {new_balance}."
+    )
+
+    # Best-effort: log to Google Sheets + ping the admin. Neither failing
+    # ever loses the request — it's already safe in the local DB and
+    # viewable from /admin -> Redemptions, or via /admin -> Export CSV.
+    await asyncio.to_thread(sheets.append_redemption, user.id, username, email, reward["label"], cost)
+    if ADMIN_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    f"🎁 New redemption request (#{redemption_id})\n"
+                    f"User: @{username} (ID: {user.id})\n"
+                    f"Product: {reward['label']}\n"
+                    f"Cost: {cost} referral(s)\n"
+                    f"Email: {email}\n"
+                    f"Their new balance: {new_balance}"
+                ),
+            )
+        except TelegramError:
+            pass
+
+
+async def handle_free_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Single dispatcher for all plain text/file replies:
+    - the admin's config-edit flows (only when ADMIN_ID has one in progress)
+    - a user's pending 'send me your email' reward redemption
+    No-ops for everyone else / when nothing is in progress, so the bot
+    doesn't reply to random chat messages."""
+    user = update.effective_user
+    message = update.message
+    text = (message.text or message.caption or "").strip()
+
+    if text == "/cancel":
+        had_admin_flow = user.id == ADMIN_ID and bool(context.user_data.get("awaiting"))
+        had_redeem_flow = bool(context.user_data.get("awaiting_email_for"))
+        context.user_data.clear()
+        if had_admin_flow:
+            await message.reply_text("Cancelled.", reply_markup=admin_menu_keyboard())
+        elif had_redeem_flow:
+            await message.reply_text("Cancelled — nothing was deducted.")
+        return
+
+    if user.id == ADMIN_ID and context.user_data.get("awaiting"):
+        await handle_admin_awaiting(update, context, text)
+        return
+
+    if context.user_data.get("awaiting_email_for"):
+        await handle_redeem_email(update, context, text)
+        return
+
+    # No flow in progress for this user — stay quiet.
+
+
 async def add_referral(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin-only: manually adjust a user's referral count.
+    """Admin-only: manually adjust a user's referral balance.
     Usage: /addref <user_id> [amount]   (amount defaults to 1, can be negative to subtract)
     Kept as a direct command for power users — the admin panel does the same thing with buttons.
     """
@@ -901,21 +1208,9 @@ async def add_referral(update: Update, context: ContextTypes.DEFAULT_TYPE):
         add_user(target_id, "unknown")
 
     add_referral_count(target_id, amount)
-    _, _, _, referral_count, verified_join, got_service = get_user(target_id)
+    _, _, _, balance, _ = get_user(target_id)
 
-    await update.message.reply_text(f"✅ User {target_id} now has {referral_count} referral(s).")
-
-    required = int(get_field_value("required"))
-    if verified_join and referral_count >= required and not got_service:
-        set_got_service(target_id)
-        delivered = await deliver_service(context, target_id)
-        if delivered:
-            await update.message.reply_text(f"🎉 Service auto-delivered to {target_id}.")
-        else:
-            await update.message.reply_text(
-                f"⚠️ Couldn't message {target_id} directly — they probably haven't started "
-                f"a chat with the bot yet. They can grab it themselves with /myservice once they do."
-            )
+    await update.message.reply_text(f"✅ User {target_id} now has {balance} referral(s).")
 
 
 # --------------------------------------------------------------------------
@@ -927,7 +1222,7 @@ async def register_commands(application):
     plain user commands. Runs once automatically when the bot starts."""
     user_commands = [
         BotCommand("start", "Show the greeting & task"),
-        BotCommand("myservice", "Get your reward buttons again"),
+        BotCommand("rewards", "See your balance & redeem a reward"),
     ]
     await application.bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
 
@@ -935,7 +1230,7 @@ async def register_commands(application):
         admin_commands = user_commands + [
             BotCommand("admin", "Open the admin control panel"),
             BotCommand("stats", "Quick usage stats"),
-            BotCommand("addref", "Manually adjust a referral count"),
+            BotCommand("addref", "Manually adjust a referral balance"),
         ]
         await application.bot.set_my_commands(
             admin_commands, scope=BotCommandScopeChat(chat_id=ADMIN_ID)
@@ -954,16 +1249,18 @@ def main():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(register_commands).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(CommandHandler("myservice", my_service))
+    app.add_handler(CommandHandler("rewards", rewards_command))
+    app.add_handler(CommandHandler("myservice", my_service))  # legacy alias
     app.add_handler(CommandHandler("addref", add_referral))
     app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(CallbackQueryHandler(verify, pattern="^verify$"))
     app.add_handler(CallbackQueryHandler(show_referral_link, pattern="^show_ref$"))
-    app.add_handler(CallbackQueryHandler(get_service_item, pattern="^get_"))
+    app.add_handler(CallbackQueryHandler(show_rewards_callback, pattern="^show_rewards$"))
+    app.add_handler(CallbackQueryHandler(redeem_reward, pattern="^redeem_"))
     app.add_handler(CallbackQueryHandler(admin_callback, pattern="^adm:"))
-    # Must be last: catches the admin's plain-text/file replies while a panel
-    # flow is waiting on a value. No-ops for everyone else / when idle.
-    app.add_handler(MessageHandler((filters.TEXT | filters.Document.ALL) & ~filters.COMMAND, admin_flow_input))
+    # Must be last: catches free-text/file replies while a panel flow or a
+    # redeem-email flow is waiting on a value. No-ops otherwise.
+    app.add_handler(MessageHandler((filters.TEXT | filters.Document.ALL) & ~filters.COMMAND, handle_free_text_input))
 
     logger.info("Bot started. Polling for updates...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
